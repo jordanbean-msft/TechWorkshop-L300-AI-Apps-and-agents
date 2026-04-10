@@ -1,0 +1,96 @@
+name: Build and Deploy to Container App
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+
+    permissions:
+      id-token: write
+      contents: read
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set image tag
+        id: image
+        run: |
+          COMMIT_SHA=${{ github.sha }}
+          IMAGE_TAG=${COMMIT_SHA:0:7}
+          echo "tag=$IMAGE_TAG" >> $GITHUB_OUTPUT
+          echo "Image tag: $IMAGE_TAG"
+
+      - name: Azure Login
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Get ACR credentials
+        id: acr
+        run: |
+          ACR_NAME=$(az containerapp show \
+            --name ${{ secrets.CONTAINER_APP_NAME }} \
+            --resource-group ${{ secrets.RESOURCE_GROUP_NAME }} \
+            --query "properties.template.containers[0].image" \
+            --output tsv | cut -d'/' -f1 | cut -d'.' -f1)
+          
+          ACR_LOGIN_SERVER="${ACR_NAME}.azurecr.io"
+          
+          # Get ACR credentials
+          ACR_CREDENTIALS=$(az acr credential show \
+            --name $ACR_NAME \
+            --query "[username, passwords[0].value]" \
+            --output tsv)
+          
+          ACR_USERNAME=$(echo "$ACR_CREDENTIALS" | awk '{print $1}')
+          ACR_PASSWORD=$(echo "$ACR_CREDENTIALS" | awk '{print $2}')
+          
+          echo "registry=$ACR_LOGIN_SERVER" >> $GITHUB_OUTPUT
+          echo "username=$ACR_USERNAME" >> $GITHUB_OUTPUT
+          echo "::add-mask::$ACR_PASSWORD"
+          echo "password=$ACR_PASSWORD" >> $GITHUB_OUTPUT
+          echo "acr_name=$ACR_NAME" >> $GITHUB_OUTPUT
+
+      - name: Build Docker image
+        run: |
+          docker build \
+            --tag ${{ steps.acr.outputs.registry }}/chat-app:${{ steps.image.outputs.tag }} \
+            --file src/Dockerfile \
+            src/
+
+      - name: Push image to ACR
+        run: |
+          docker login \
+            --username ${{ steps.acr.outputs.username }} \
+            --password ${{ steps.acr.outputs.password }} \
+            ${{ steps.acr.outputs.registry }}
+          
+          docker push ${{ steps.acr.outputs.registry }}/chat-app:${{ steps.image.outputs.tag }}
+
+      - name: Update Container App
+        run: |
+          az containerapp update \
+            --name ${{ secrets.CONTAINER_APP_NAME }} \
+            --resource-group ${{ secrets.RESOURCE_GROUP_NAME }} \
+            --image ${{ steps.acr.outputs.registry }}/chat-app:${{ steps.image.outputs.tag }} \
+            --set-env-vars \
+              FOUNDRY_ENDPOINT="${{ secrets.FOUNDRY_ENDPOINT }}" \
+              gpt_endpoint="${{ secrets.gpt_endpoint }}" \
+              embedding_endpoint="${{ secrets.embedding_endpoint }}" \
+              phi_4_endpoint="${{ secrets.phi_4_endpoint }}"
+
+      - name: Verify deployment
+        run: |
+          echo "Container App updated successfully with image tag: ${{ steps.image.outputs.tag }}"
+          echo "Environment variables set:"
+          echo "  - FOUNDRY_ENDPOINT"
+          echo "  - gpt_endpoint"
+          echo "  - embedding_endpoint"
+          echo "  - phi_4_endpoint"
